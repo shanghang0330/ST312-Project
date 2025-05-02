@@ -1,0 +1,350 @@
+```{r}
+library(mice)
+library(grpreg)
+library(dplyr)
+
+dataset <- read.csv("preprocessed_data.csv")
+```
+
+## Preprocess and Declare Variable Type
+
+```{r}
+# Declare variable types
+categorical_vars <- c(
+  "truant", "gor_x", "w2fat5yp", "w2ethnicyp",
+  "w3outschbyp", "w3parqualmp", "w4concenyp", 
+  "w4lnpar", "w4noconfyp", "w4readsyp",
+  "w7heflag", "w9danvqh", "w9dvnvqh", "w9drussell",
+  "marital_status_MP", "job_attd", "w2hiqualgmp"
+)
+binary_vars <- c("w6univyp", "w2sexyp", "drugs")
+outcome <- "w9_income_above_median"
+
+# convert to factors
+dataset[categorical_vars] <- lapply(dataset[categorical_vars], as.factor)
+dataset[binary_vars] <- lapply(dataset[binary_vars], as.factor)
+dataset[[outcome]] <- as.factor(dataset[[outcome]])
+```
+
+```{r}
+reset_baselines <- function(data, baselines) {
+  for (var in names(baselines)) {
+    if (var %in% names(data)) {
+      data[[var]] <- relevel(factor(data[[var]]), ref = baselines[[var]])
+    } else {
+      warning(paste("Variable", var, "not found in data. Skipping."))
+    }
+  }
+  return(data)
+}
+
+```
+
+
+## Test Training Split
+```{r}
+set.seed(39748)
+n <- nrow(dataset)
+train_index <- sample(n, floor(0.8 * n))
+training_data <- dataset[train_index, ]
+testing_data  <- dataset[-train_index, ]
+```
+
+```{r}
+# Define baselines
+baselines <- list(
+  gor_x = 7,
+  w3parqualmp = 4,
+  w4concenyp = 2,
+  w4lnpar = 2,
+  w9danvqh = 4,
+  w9dvnvqh = 3,
+  w9drussell = 3,
+  marital_status_MP = 2,
+  job_attd = 3,
+  w2hiqualgmp = 3
+)
+```
+
+```{r}
+# Reset baseline levels
+training_data <- reset_baselines(training_data, baselines)
+testing_data  <- reset_baselines(testing_data, baselines)
+```
+
+## MICE Setup
+```{r}
+method <- rep("pmm", ncol(training_data))
+names(method) <- colnames(training_data)
+method[categorical_vars] <- "polyreg"
+method[binary_vars] <- "logreg"
+method[outcome] <- ""  
+
+num_imputations <- 25
+imp <- mice(training_data, m = num_imputations, method = method, seed = 39748, printFlag = TRUE)
+```
+
+## Multiple Imputations Diagnostics
+
+```{r}
+densityplot(imp, ~ w2fat5yp)
+densityplot(imp, ~ w3parqualmp)
+densityplot(imp, ~ w4ghq12scr)
+densityplot(imp, ~ w4concenyp)
+```
+
+```{r}
+plot(imp, c("w3parqualmp", "w2fat5yp"))
+```
+## Convergence Analysis
+```{r}
+library('miceadds')
+
+psrf_df <- Rhat.mice(imp)
+ac_df <- convergence(imp, diagnostic = "ac", parameter = "mean")
+conv_all <- convergence(imp, diagnostic = "all", parameter = "mean")
+head(conv_all)
+```
+
+## Apply Scaling to Continuous Predictors
+```{r}
+# Figure out which predictors are continuous (to scale)
+# here numeric cols in training_data are the continuous vars
+cont_vars <- names(training_data)[ sapply(training_data, is.numeric) ]
+cont_vars <- setdiff(cont_vars, outcome)
+
+# compute global mean & sd on original training data
+gm <- colMeans(training_data[cont_vars], na.rm = TRUE)
+gs <- apply(training_data[cont_vars], 2, sd, na.rm = TRUE)
+```
+
+## Setup for Model Fitting
+
+```{r}
+# Extract & scale each completed imputation
+completed_list <- lapply(complete(imp, "all"), function(df) {
+  # scale continuous
+  df[cont_vars] <- scale(df[cont_vars], center = gm, scale = gs)
+  df
+})
+
+# Prepare group indices (based on first completed df)
+# build model.matrix once to get dummy‐expansion for factors
+formula <- as.formula(paste(outcome, "~", paste(setdiff(names(training_data), outcome), collapse = "+")))
+X0 <- model.matrix(formula, data = completed_list[[1]])[, -1]
+colnames0 <- colnames(X0)
+
+# For each original predictor, count how many columns it spawned
+orig_preds <- setdiff(names(training_data), outcome)
+group_ids <- rep(
+  seq_along(orig_preds),
+  times = sapply(orig_preds, function(v) sum(startsWith(colnames0, paste0(v))))
+)
+```
+
+
+## Perform CV to find best lambda
+
+```{r}
+# Perform within-imputation CV to pick lambda
+lambda_min <- numeric(num_imputations)
+
+for (i in seq_len(num_imputations)) {
+  df <- completed_list[[i]]
+  X_i <- model.matrix(formula, data = df)[, -1]
+  y_i <- as.numeric(df[[outcome]]) - 1
+  
+  cv_i <- cv.grpreg(
+    X_i, y_i,
+    group   = group_ids,
+    penalty = "grLasso",
+    family  = "binomial"
+  )
+  lambda_min[i] <- cv_i$lambda.min
+}
+
+# Pick a consensus lambda
+lambda_star <- median(lambda_min)
+lambda_star
+```
+
+## Identify Selected Predictors
+
+```{r}
+# Re-fit final models and tally selected predictors
+selected_list <- vector("list", num_imputations)
+
+for (i in seq_len(num_imputations)) {
+  df  <- completed_list[[i]]
+  X_i <- model.matrix(formula, data = df)[, -1]
+  y_i <- as.numeric(df[[outcome]]) - 1
+
+  fit_i <- grpreg(
+    X_i, y_i,
+    group   = group_ids,
+    penalty = "grLasso",
+    family  = "binomial",
+    lambda  = lambda_star
+  )
+  coefs <- coef(fit_i)
+  nz    <- which(coefs[-1] != 0)
+  selected_list[[i]] <- unique(orig_preds[group_ids[nz]])
+}
+
+# Show selection frequency of predictors
+sel_freq <- table(unlist(selected_list))
+
+# Select those in >= 60% of imputations
+final_vars <- names(sel_freq)[ sel_freq >= 0.6 * num_imputations ]
+
+cat("Majority-selected predictors (≥60% of imputations):\n", paste(final_vars, collapse = ", "), "\n")
+sel_freq
+```
+
+## Bar plot of Selected Predictors
+
+```{r}
+# Barplot of variable selection frequency
+barplot(sel_freq[order(sel_freq, decreasing = TRUE)],
+        las = 2, col = "skyblue",
+        main = "Variable Selection Frequency",
+        ylab = "Number of Imputations Selected")
+abline(h = 0.6 * num_imputations, col = "red", lty = 2)
+```
+
+## Refit on Logistic Regression by Rubin's Rule
+
+```{r}
+# Group all majority predictors
+final_form <- as.formula(
+  paste(outcome, "~", paste(final_vars, collapse = "+"))
+)
+
+# Fit a logistic model on each imputation
+fit_logit <- with(
+  data = imp,
+  expr = glm(final_form, family = binomial, data = training_data)
+)
+
+# Pool estimates
+pooled   <- pool(fit_logit)
+summary(pooled)
+```
+
+```{r}
+library(pROC)
+
+# storage
+auc_vals <- numeric(num_imputations)
+acc_vals <- numeric(num_imputations)
+
+for(i in seq_len(num_imputations)){
+  # 1. extract the i-th completed dataset
+  dat_i <- complete(imp, action = i)
+
+  # 2. fit the model on that completed data
+  fit_i <- glm(final_form, family = binomial, data = dat_i)
+
+  # 3. get predicted probabilities
+  p_i <- predict(fit_i, type = "response")
+
+  # 4. compute AUC
+  roc_i    <- roc(dat_i[[outcome]], p_i)
+  auc_vals[i] <- as.numeric(roc_i$auc)
+
+  # 5. compute accuracy at threshold 0.5
+  yhat_i  <- ifelse(p_i > 0.5, 1, 0)
+  acc_vals[i] <- mean(yhat_i == dat_i[[outcome]])
+}
+
+# 6. pool by simple averaging
+mean_auc <- mean(auc_vals)
+mean_acc <- mean(acc_vals)
+sd_auc <- sd(auc_vals)
+sd_acc <- sd(acc_vals)
+
+cat("Train set accuracy:", round(mean_acc, 4), "±", round(sd_acc, 4), "\n")
+cat("Train set AUC:", round(mean_auc, 4), "±", round(sd_auc, 4), "\n")
+```
+
+## Compute Model Performance Metrics
+
+```{r}
+library(pROC)
+
+# Impute & scale test set like training
+imp_test <- mice(testing_data, m = num_imputations, method = method, seed = 456)
+completed_test_list <- lapply(complete(imp_test, "all"), function(df) {
+  df[cont_vars] <- scale(df[cont_vars], center = gm, scale = gs)
+  df
+})
+
+
+# Extract unpenalised glm fits
+fits <- fit_logit$analyses  
+
+# Generate preds_list
+preds_list <- lapply(
+  seq_len(num_imputations),
+  function(i) {
+    predict(
+      fits[[i]],
+      newdata = completed_test_list[[i]],
+      type    = "response"
+    )
+  }
+)
+
+# Store AUC and accuracy per imputation
+auc_i <- numeric(num_imputations)
+acc_i <- numeric(num_imputations)
+
+for (i in seq_len(num_imputations)) {
+  # Get predicted probabilities and true labels for this imputation
+  pred_prob_i <- preds_list[[i]]
+  actual_i    <- completed_test_list[[i]][[outcome]]
+
+  # AUC
+  roc_i <- roc(actual_i, pred_prob_i)
+  auc_i[i] <- as.numeric(auc(roc_i))
+
+  # Accuracy
+  pred_class_i <- ifelse(pred_prob_i > 0.5,
+                         levels(dataset[[outcome]])[2],
+                         levels(dataset[[outcome]])[1])
+  acc_i[i] <- mean(pred_class_i == actual_i)
+}
+
+# Report mean ± sd
+cat("Test set accuracy:", round(mean(acc_i), 4), "±", round(sd(acc_i), 4), "\n")
+cat("Test set AUC:", round(mean(auc_i), 4), "±", round(sd(auc_i), 4), "\n")
+```
+```{r}
+library(caret)
+
+# 1. Stack your preds_list into a matrix (rows = cases, cols = imputations)
+preds_mat <- do.call(cbind, preds_list)   # dim: nrow(test) × num_imputations
+
+# 2. Compute the mean predicted probability for each case
+mean_pred_prob <- rowMeans(preds_mat)
+
+# 3. Get the single “averaged” predicted class at cutoff = 0.5
+avg_pred_class <- factor(
+  ifelse(mean_pred_prob > 0.5,
+         levels(dataset[[outcome]])[2],
+         levels(dataset[[outcome]])[1]),
+  levels = levels(dataset[[outcome]])
+)
+
+# 4. Pull out the true labels once (they’re the same across imputations)
+actual_all <- completed_test_list[[1]][[outcome]]
+
+# 5. Build the confusion matrix
+cm_avg <- confusionMatrix(avg_pred_class, actual_all,
+                          positive = levels(actual_all)[2])
+
+# 6. View the raw 2×2 table and key metrics
+cm_avg$table
+cm_avg$overall["Accuracy"]
+cm_avg$byClass[c("Sensitivity","Specificity")]
+```

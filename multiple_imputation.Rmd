@@ -1,0 +1,42 @@
+## Test Training Split
+```{r}
+set.seed(39748)
+n <- nrow(dataset)
+train_index <- sample(n, floor(0.8 * n))
+training_data <- dataset[train_index, ]
+testing_data  <- dataset[-train_index, ]
+```
+
+## MICE Setup
+```{r}
+method <- rep("pmm", ncol(training_data))
+names(method) <- colnames(training_data)
+method[categorical_vars] <- "polyreg"
+method[binary_vars] <- "logreg"
+method[outcome] <- ""  
+
+num_imputations <- 25
+imp <- mice(training_data, m = num_imputations, method = method, seed = 39748, printFlag = TRUE, maxit=10)
+```
+
+## Multiple Imputations Diagnostics
+
+```{r}
+densityplot(imp, ~ w2fat5yp)
+densityplot(imp, ~ w3parqualmp)
+densityplot(imp, ~ w4ghq12scr)
+densityplot(imp, ~ w4concenyp)
+```
+
+```{r}
+plot(imp, c("w3parqualmp", "w2fat5yp"))
+```
+## Convergence Analysis
+```{r}
+library('miceadds')
+
+psrf_df <- Rhat.mice(imp)
+ac_df <- convergence(imp, diagnostic = "ac", parameter = "mean")
+conv_all <- convergence(imp, diagnostic = "all", parameter = "mean")
+head(conv_all)
+```

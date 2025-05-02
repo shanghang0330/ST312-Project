@@ -1,0 +1,220 @@
+---
+title: "30Apr"
+author: "SHC"
+date: "2025-04-30"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(dplyr)
+library(tidymodels)
+library(rsample) 
+library(pROC)
+library(glmnet)
+library(caret)
+library(mice)
+library(miceadds)
+library(glmnet)
+library(purrr)
+```
+
+```{r}
+dataset <- read.csv('preprocessed_data.csv')
+```
+
+```{r}
+dataset
+```
+
+```{r}
+categorical_vars <- c(
+  "truant", "gor_x", "w2fat5yp", "w2ethnicyp",
+  "w3outschbyp", "w3parqualmp", "w4concenyp", 
+  "w4lnpar", "w4noconfyp", "w4readsyp",
+  "w7heflag", "w9danvqh", "w9dvnvqh", "w9drussell", "marital_status_MP", 
+  "job_attd", "w2hiqualgmp"
+)
+
+binary_vars <- c(
+  "w6univyp", "w2sexyp", "drugs"
+)
+
+dataset[categorical_vars] <- lapply(dataset[categorical_vars], as.factor)
+dataset[binary_vars] <- lapply(dataset[binary_vars], as.factor)
+dataset$w9_income_above_median <- as.factor(dataset$w9_income_above_median)
+```
+
+MICE
+
+```{r}
+dataset_clean <- dataset %>% drop_na()
+(nrow(dataset) - nrow(dataset_clean))/nrow(dataset)
+```
+
+```{r}
+# write.csv(dataset_clean, "complete_case_dataset.csv", row.names = FALSE)
+```
+
+```{r}
+# Assume categorical_vars is a vector of your categorical variable names
+for (var in categorical_vars) {
+  cat("\n---", var, "---\n")
+  print(table(dataset[[var]], useNA = "ifany"))
+}
+```
+
+
+
+
+```{r}
+reset_baselines <- function(data, baselines) {
+  for (var in names(baselines)) {
+    if (var %in% names(data)) {
+      data[[var]] <- relevel(factor(data[[var]]), ref = baselines[[var]])
+    } else {
+      warning(paste("Variable", var, "not found in data. Skipping."))
+    }
+  }
+  return(data)
+}
+```
+
+
+
+
+```{r}
+set.seed(39748)
+n <- nrow(dataset)
+train_index <- sample(1:n, size = floor(0.8 * n))
+training_dataset <- dataset[train_index, ]
+testing_dataset <- dataset[-train_index, ]
+```
+
+```{r}
+# Define baselines
+baselines <- list(
+  gor_x = 7,
+  w3parqualmp = 4,
+  w4concenyp = 2,
+  w4lnpar = 2,
+  w9danvqh = 4,
+  w9dvnvqh = 3,
+  w9drussell = 3,
+  marital_status_MP = 2,
+  job_attd = 3,
+  w2hiqualgmp = 3
+)
+```
+
+```{r}
+# Reset baseline levels
+training_dataset <- reset_baselines(training_dataset, baselines)
+testing_dataset  <- reset_baselines(testing_dataset, baselines)
+```
+
+
+
+```{r}
+# Set up method vector with names
+method <- rep("pmm", ncol(dataset))
+names(method) <- colnames(dataset)
+
+method[which(names(dataset) %in% categorical_vars)] <- "polyreg"
+method[which(names(dataset) %in% binary_vars)] <- "logreg"
+```
+
+```{r}
+# Run mice on training set
+imputed_training_data <- mice(training_dataset, m = 25, method = method, seed = 39748)
+```
+
+```{r}
+# Run mice on testing set
+imputed_testing_data <- mice(testing_dataset, m = 25, method = method, seed = 39748)
+```
+
+```{r}
+# to save
+saveRDS(imputed_training_data, file = "imputed_training_data.rds")
+saveRDS(imputed_testing_data, file = "imputed_testing_data.rds")
+
+# to load
+# mids <- readRDS("imputed_training_data.rds")
+```
+
+
+
+
+
+
+Simple Log Reg
+
+```{r}
+logreg_fit <- with(imputed_training_data, glm(
+  w9_income_above_median ~ idacirscore_y + w2sexyp + w4ghq12scr + w2ethnicyp + w2fat5yp + bullied + truant + 
+  w2hiqualgmp + w3outschbyp + w7heflag + w9danvqh + w9dvnvqh + w9drussell + imdrscore_y + gor_x + 
+  marital_status_MP + w4lnpar + w3parqualmp + w4readsyp + w4concenyp + w4noconfyp + drugs + job_attd + 
+  w6univyp, 
+  family = binomial
+))
+
+pooled_logreg_fit <- pool(logreg_fit)
+# summary(pooled_logreg_fit)
+
+significant_sorted <- summary(pooled_logreg_fit) %>%
+  filter(p.value < 0.05) %>%
+  arrange(desc(estimate))
+
+significant_sorted
+```
+
+
+
+```{r}
+set.seed(39748)
+# --- Step 0: Define the model formula (if not already defined) ---
+formula_str <- w9_income_above_median ~ idacirscore_y + w2sexyp + w4ghq12scr + 
+  w2ethnicyp + w2fat5yp + bullied + truant + w2hiqualgmp + w3outschbyp + w7heflag + 
+  w9danvqh + w9dvnvqh + w9drussell + imdrscore_y + gor_x + marital_status_MP + 
+  w4lnpar + w3parqualmp + w4readsyp + w4concenyp + w4noconfyp + drugs + job_attd + 
+  w6univyp
+
+# --- Step 2: Extract models and testing datasets ---
+models <- logreg_fit$analyses  # list of glm models
+test_list <- lapply(1:25, function(i) complete(imputed_testing_data, i))  # list of test sets
+
+# --- Step 3: Predict probabilities on each imputed test dataset ---
+pred_list <- vector("list", length = 25)
+
+for (i in 1:25) {
+  model_i <- models[[i]]
+  test_i <- test_list[[i]]
+
+  # Predict probabilities for test set i
+  pred_list[[i]] <- predict(model_i, newdata = test_i, type = "response")
+}
+
+# --- Step 4: Average predictions across imputations ---
+pred_matrix <- do.call(cbind, pred_list)   # rows = observations, cols = imputations
+final_preds <- rowMeans(pred_matrix)       # average predicted probability per observation
+pred_class <- ifelse(final_preds > 0.5, 1, 0)
+
+# --- Step 5: Evaluate performance ---
+# Get true labels from one imputed test set (they're the same across imputations)
+true_labels <- test_list[[1]]$w9_income_above_median
+
+# Accuracy
+accuracy <- mean(pred_class == true_labels)
+cat("Accuracy:", accuracy, "\n")
+
+# AUC
+roc_result <- roc(true_labels, final_preds)
+cat("AUC:", auc(roc_result), "\n")
+
+# Optional: plot ROC curve
+plot(roc_result, main = "ROC Curve - Pooled Predictions")
+
+```

@@ -1,0 +1,724 @@
+---
+title: "XGBoost with Multiple Imputations"
+author: "Joshua Ang"
+date: "2025-04-29"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(dplyr)
+library(tidymodels)
+library(rsample) 
+library(pROC)
+library(glmnet)
+library(caret)
+library(mice)
+library(miceadds)
+library(glmnet)
+library(purrr)
+library(rBayesianOptimization)
+library(xgboost)
+library(viridis)
+library(SHAPforxgboost)
+library(data.table)
+library(ggnewscale)
+```
+
+```{r}
+rm(list = ls())
+```
+
+```{r}
+dataset <- read.csv('preprocessed_data.csv')
+```
+
+```{r}
+dataset
+```
+## Convert Categorical and Binary Variables Into Factors
+
+```{r}
+categorical_vars <- c(
+  "truant", "gor_x", "w2fat5yp", "w2ethnicyp",
+  "w3outschbyp", "w3parqualmp", "w4concenyp", 
+  "w4lnpar", "w4noconfyp", "w4readsyp",
+  "w7heflag", "w9danvqh", "w9dvnvqh", "w9drussell", "marital_status_MP", 
+  "job_attd", "w2hiqualgmp"
+)
+
+binary_vars <- c(
+  "w6univyp", "w2sexyp", "drugs"
+)
+
+dataset[categorical_vars] <- lapply(dataset[categorical_vars], as.factor)
+dataset[binary_vars] <- lapply(dataset[binary_vars], as.factor)
+dataset$w9_income_above_median <- as.factor(dataset$w9_income_above_median)
+```
+
+## MICE Percentage Missing Check
+
+```{r}
+dataset_clean <- dataset %>% drop_na()
+
+# Compute missing percentage
+missing <- (nrow(dataset) - nrow(dataset_clean))/nrow(dataset)
+
+# Use rule of n imputations for n% missing data
+# n_imputations <- round(missing*100)
+n_imputations <- 25
+```
+
+## Preprocess by Variable Type
+```{r}
+dataset[categorical_vars] <- lapply(dataset[categorical_vars], as.factor)
+dataset[binary_vars] <- lapply(dataset[binary_vars], as.factor)
+dataset$w9_income_above_median <- as.factor(dataset$w9_income_above_median)
+```
+
+```{r}
+reset_baselines <- function(data, baselines) {
+  for (var in names(baselines)) {
+    if (var %in% names(data)) {
+      data[[var]] <- relevel(factor(data[[var]]), ref = baselines[[var]])
+    } else {
+      warning(paste("Variable", var, "not found in data. Skipping."))
+    }
+  }
+  return(data)
+}
+```
+
+## Test Training Split
+```{r}
+set.seed(39748)
+n <- nrow(dataset)
+train_index  <- sample(n, size = floor(0.8 * n))
+training_data <- dataset[ train_index, ]
+testing_data  <- dataset[-train_index, ]
+```
+
+```{r}
+# Define baselines
+baselines <- list(
+  gor_x = 7,
+  w3parqualmp = 4,
+  w4concenyp = 2,
+  w4lnpar = 2,
+  w9danvqh = 4,
+  w9dvnvqh = 3,
+  w9drussell = 3,
+  marital_status_MP = 2,
+  job_attd = 3,
+  w2hiqualgmp = 3
+)
+```
+
+```{r}
+# Reset baseline levels
+training_data <- reset_baselines(training_data, baselines)
+testing_data  <- reset_baselines(testing_data, baselines)
+```
+
+## Setup MICE Vector
+```{r}
+# Use predictive mean matching (pmm) for continuous variables
+# Treatment for continuous variables
+method <- rep("pmm", ncol(dataset)) 
+names(method) <- colnames(dataset)
+
+# Treatment for categorical variables
+method[categorical_vars] <- "polyreg"
+
+# Treatement for binary  variables
+method[binary_vars] <- "logreg"
+
+# We do not perform any imputation on the target
+method["w9_income_above_median"] <- ""
+```
+
+## Setup objective function for bayesian hyperparam search
+```{r}
+## master feature template: ensures consistent feature set
+all_names <- colnames(
+  model.matrix(w9_income_above_median ~ . -1, data = training_data)
+)
+
+## helper function: creates a DMatrix ensuring correct column alignment
+build_dtrain <- function(data) {
+  # Convert dataset to a model matrix
+  X <- model.matrix(w9_income_above_median ~ . -1, data = data)
+
+  # Identify missing columns compared to master template
+  miss <- setdiff(all_names, colnames(X))
+  
+  # If columns are missing, add them filled with zeros
+  if (length(miss)) {
+    X <- cbind(X, matrix(0, nrow(X), length(miss), dimnames = list(NULL, miss)))
+  }
+
+  # Reorder columns to match master template exactly
+  X <- X[, all_names, drop = FALSE]
+
+  # Create binary label
+  y <- as.integer(data$w9_income_above_median) - 1
+
+  # Return as XGBoost DMatrix
+  xgb.DMatrix(X, label = y)
+}
+
+## Generate a list of DMatrix objects, each based on a different imputation
+dtrain_list <- lapply(seq_len(n_imputations), function(i) {
+  # Impute missing data using MICE
+  tra <- complete(mice(training_data, m = 1,
+                       method = method,
+                       seed = 2000 + i,
+                       printFlag = TRUE))
+  # Build the corresponding DMatrix
+  build_dtrain(tra)
+})
+
+## Function generator: Creates an XGBoost cross-validation function used for Bayesian optimisation
+make_xgb_cv_bayes <- function(dtrain_list, logfile) {
+
+  function(max_depth, eta, subsample, colsample_bytree, min_child_weight) {
+
+    tryCatch({
+      # Sanitize hyperparameters to acceptable XGBoost ranges
+      int_md  <- max(3L, round(max_depth))
+      int_mcw <- max(1L, round(min_child_weight))
+      eta <- pmin(pmax(eta, 1e-3), 1)
+      subs <- pmin(pmax(subsample, 0.10), 1)
+      csbt <- pmin(pmax(colsample_bytree, 0.10), 1)
+
+      # Log current hyperparameters
+      cat(sprintf("%s | PARAMS: max_depth=%d, eta=%.4f, subsample=%.2f, ",
+                  Sys.time(), int_md, eta, subs),
+          sprintf("colsample=%.2f, min_child=%d\n", csbt, int_mcw),
+          file = logfile, append = TRUE)
+
+      aucs  <- numeric(length(dtrain_list))
+      iters <- integer(length(dtrain_list))
+
+      # Perform cross-validation for each imputation
+      for (i in seq_along(dtrain_list)) {
+
+        cat(sprintf("  - [%s] Imputation %d start\n", Sys.time(), i),
+            file = logfile, append = TRUE)
+
+        res <- tryCatch({
+          # Perform cross-validation with early stopping
+          cv <- xgb.cv(
+            params = list(
+              objective = "binary:logistic",
+              eval_metric = "auc",
+              max_depth = int_md,
+              eta = eta,
+              subsample = subs,
+              colsample_bytree = csbt,
+              min_child_weight = int_mcw
+            ),
+            data = dtrain_list[[i]],
+            nrounds = 500,
+            nfold = 5,
+            early_stopping_rounds = 20,
+            verbose = FALSE
+          )
+
+          # Record best AUC and iteration
+          auc_val  <- max(cv$evaluation_log$test_auc_mean)
+          iter_val <- cv$best_iteration
+
+          cat(sprintf("    --> AUC=%.5f, BestIter=%d\n", auc_val, iter_val),
+              file = logfile, append = TRUE)
+
+          list(auc = auc_val, iter = iter_val)
+
+        }, error = function(e) {
+          # Log any error during individual imputation runs
+          cat(sprintf("    !! ERROR on imputation %d: %s\n", i, e$message),
+              file = logfile, append = TRUE)
+          list(auc = NA_real_, iter = NA_integer_)
+        })
+
+        cat(sprintf("  - [%s] Imputation %d end\n", Sys.time(), i),
+            file = logfile, append = TRUE)
+
+        aucs[i]  <- res$auc
+        iters[i] <- res$iter
+      } # end loop over imputations
+
+      # Check if any finite results were obtained
+      if (!any(is.finite(aucs)) || !any(is.finite(iters))) {
+        cat("  !! No finite results, returning (0,0)\n\n",
+            file = logfile, append = TRUE)
+        return(list(Score = 0, Pred = 0))
+      }
+
+      # Compute average score and iteration across imputations
+      final_score <- mean(aucs,  na.rm = TRUE)
+      final_iter  <- round(mean(iters, na.rm = TRUE))
+
+      cat(sprintf("  >> Returning: Score=%.5f, Pred=%d\n\n",
+                  final_score, final_iter),
+          file = logfile, append = TRUE)
+
+      list(Score = final_score, Pred = final_iter)
+
+    }, error = function(e) {
+      # Handle top-level errors gracefully
+      cat(sprintf("%s | !! TOP-LEVEL ERROR: %s\n", Sys.time(), e$message),
+          file = logfile, append = TRUE)
+      list(Score = 0, Pred = 0)
+    })
+  }  # end inner function
+}
+
+# Create log file name based on current timestamp
+logfile <- paste0("bayes_opt_log_", format(Sys.time(), "%Y%m%d_%H%M"), ".txt")
+
+# Instantiate Bayesian-optimized cross-validation function
+xgb_cv_bayes <- make_xgb_cv_bayes(dtrain_list, logfile)
+
+# Wrap safely to handle potential failures in optimisation
+safe_xgb_cv <- possibly(
+  .f = xgb_cv_bayes,
+  otherwise = list(Score = 0, Pred = 0)
+)
+```
+
+## Run Bayesian Optimisation
+
+```{r}
+# Set up hyperparam search space
+bounds <- list(
+  max_depth = c(3L, 10L),
+  eta = c(0.001, 0.3),
+  subsample = c(0.7, 1.0),
+  colsample_bytree = c(0.7, 1.0),
+  min_child_weight = c(3L, 15L)
+)
+
+set.seed(39748)
+
+# Run optimisation with the objective function defined 
+opt_res <- BayesianOptimization(
+  FUN = safe_xgb_cv,
+  bounds = bounds,
+  init_points = 10,
+  n_iter = 50,
+  acq = "ei",
+  verbose = TRUE
+)
+```
+
+```{r}
+## Extract best hyperparams across all hyperparam combos
+best_pars <- opt_res$Best_Par
+best_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = as.integer(best_pars["max_depth"]),
+  eta = best_pars["eta"],
+  subsample = best_pars["subsample"],
+  colsample_bytree = best_pars["colsample_bytree"],
+  min_child_weight = as.integer(best_pars["min_child_weight"])
+)
+
+# Define function to process the hyperparam search history stored
+get_best_from_opt <- function(opt_res) {
+  h <- opt_res$History
+  i <- which.max(h$Value)
+  list(
+    Score = h$Value[i],
+    Round = h$Round[i]
+  )
+}
+
+# Best number of boosted iteration rounds across all hyperparam combos
+best <- get_best_from_opt(opt_res)
+best_nrounds <- best$Round
+best_nrounds
+```
+```{r}
+library(ggplot2)
+# pull out the history
+df <- opt_res$History
+
+# make depth a factor so it’s treated discretely
+df$max_depth <- factor(df$max_depth)
+
+# boxplot + jitter
+ggplot(df, aes(x = max_depth, y = Value)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.2, size = 1, alpha = 0.8) +
+  labs(
+    x = "Tree Depth (max_depth)",
+    y = "Validation AUC",
+    title = "Distribution of AUC Scores by Tree Depth"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# add iteration counter and running incumbent
+history_inc <- opt_res$History %>% 
+  mutate(iter        = row_number(),
+         best_so_far = cummax(Value))
+
+# iteration where the global best is first met
+stop_iter <- history_inc %>% 
+  slice_max(best_so_far, n = 1, with_ties = FALSE)
+
+ggplot() +
+  # all individual trial results
+  geom_point(data = history_inc,
+             aes(iter, Value),
+             colour = "grey60", alpha = 0.6, size = 1.3) +
+  # incumbent staircase
+  geom_line(data = history_inc,
+            aes(iter, best_so_far),
+            colour = "navy", linewidth = 0.9) +
+  # mark the first best
+  geom_point(data = stop_iter,
+             aes(iter, best_so_far),
+             colour = "red", size = 3) +
+  labs(title = "Bayesian optimisation – AUC over iterations",
+       x     = "Iteration",
+       y     = "AUC") +
+  theme_minimal(base_size = 12)
+```
+
+## Fit Final Boosted Tree based on Hyperparams Determined
+
+```{r}
+# Extract master feature names from training data
+all_names <- colnames(
+  model.matrix(w9_income_above_median ~ . -1, data = training_data)
+)
+
+# Build design matrix and ensure columns align with master list
+realign_mm <- function(df) {
+  X <- model.matrix(w9_income_above_median ~ . -1, data = df)
+  miss <- setdiff(all_names, colnames(X))
+  if (length(miss)) {
+    X <- cbind(
+      X,
+      matrix(0, nrow(X), length(miss), dimnames = list(NULL, miss))
+    )
+  }
+  X[, all_names, drop = FALSE]
+}
+
+# Prepare list to store final xgboost models
+final_models <- vector("list", n_imputations)
+
+# Log the start of the final fitting process
+cat(Sys.time(), "\n", file = logfile, append = TRUE)
+cat("  Starting final ensemble fit...\n", file = logfile, append = TRUE)
+
+# Extract & scale each completed imputation
+imp <- mice(training_data, m = n_imputations, method = method, seed = 39748, printFlag = TRUE)
+completed_list <- lapply(complete(imp, "all"), function(df) {
+  df
+})
+
+final_models <- vector("list", length(completed_list))
+
+for (i in seq_along(completed_list)) {
+  tra <- completed_list[[i]]
+  X   <- realign_mm(tra)
+  y   <- as.integer(tra$w9_income_above_median) - 1
+  
+  final_models[[i]] <- xgb.train(
+    params  = best_params,
+    data    = xgb.DMatrix(X, label = y),
+    nrounds = best_nrounds,
+    verbose = 1
+  )
+}
+```
+
+
+## Training Metrics
+```{r}
+library(pROC)
+
+# 0) Identify rows with a valid outcome
+idx <- which(!is.na(completed_list[[1]]$w9_income_above_median))
+
+# 1) True labels (only for those rows)
+true_y_sub <- as.integer(completed_list[[1]]$w9_income_above_median[idx]) - 1
+
+# 2) Get matrix of predicted probabilities (only on idx rows)
+train_preds <- sapply(seq_along(final_models), function(i) {
+  X_all <- realign_mm(completed_list[[i]])
+  X_sub <- X_all[idx, , drop = FALSE]
+  predict(final_models[[i]], xgb.DMatrix(X_sub))
+})
+
+# 3) Compute per-imputation metrics
+accuracies <- apply(train_preds > 0.5, 2, function(pred_bin) {
+  mean(pred_bin == true_y_sub)
+})
+
+aucs <- apply(train_preds, 2, function(prob) {
+  as.numeric(auc(roc(true_y_sub, prob)))
+})
+
+# 4) Summarize and print
+metrics_df <- data.frame(
+  imputation = seq_along(accuracies),
+  accuracy   = accuracies,
+  auc        = aucs
+)
+
+# define auc_val before using it
+auc_val <- mean(aucs)
+
+cat("Final training accuracy:", mean(accuracies), "±", sd(accuracies), "\n")
+cat("Final training AUC: ", auc_val, "±", sd(aucs), "\n")
+```
+
+```{r}
+# Identify rows with a valid income label
+idx <- which(!is.na(completed_list[[1]]$w9_income_above_median))
+
+# Build train_preds on exactly those rows
+train_preds <- sapply(seq_along(final_models), function(i) {
+  X_all <- realign_mm(completed_list[[i]])
+  X_sub <- X_all[idx, , drop = FALSE]              # <-- subset here
+  predict(final_models[[i]], xgb.DMatrix(X_sub))
+})
+
+# Match true_y to the same rows
+true_y_sub <- as.integer(completed_list[[1]]$w9_income_above_median[idx]) - 1
+
+# Sanity check
+stopifnot(nrow(train_preds) == length(true_y_sub))
+
+# Now you can compute a confusion matrix without error
+pred_bin <- train_preds > 0.5
+cm_pooled <- table(
+  Predicted = as.integer(pred_bin[,1]),
+  Actual    = true_y_sub
+)
+dimnames(cm_pooled) <- list(Predicted = c("0","1"), Actual = c("0","1"))
+print(cm_pooled)
+```
+
+```{r}
+# Test Set Evaluation
+test_preds <- sapply(1:n_imputations, function(i) {
+  te <- complete(mice(testing_data, m = 1, method = method, seed = 3000 + i, printFlag = FALSE))
+  Xtest <- realign_mm(te)
+  predict(final_models[[i]], xgb.DMatrix(Xtest))
+})
+
+final_prob  <- rowMeans(test_preds)
+final_prob_sd <- apply(test_preds, 1, sd)
+final_class <- ifelse(final_prob > 0.5, 1, 0)
+
+true_y <- as.integer(testing_data$w9_income_above_median) - 1
+
+accuracy_i <- sapply(1:n_imputations, function(i) {
+  pred_class_i <- ifelse(test_preds[, i] > 0.5, 1, 0)
+  mean(pred_class_i == true_y)
+})
+auc_i <- sapply(1:n_imputations, function(i) {
+  auc( roc(true_y, test_preds[, i]) )
+})
+
+cat("Final test accuracy:", mean(accuracy_i),"±", sd(accuracy_i), "\n")
+cat("Final test AUC: ", mean(auc_i),"±", sd(auc_i), "\n")
+```
+
+## Visualise Variable Importance
+
+```{r}
+# Extract variable importance from each model
+importance_list <- lapply(final_models, function(model) {
+  imp <- xgb.importance(model = model)[, c("Feature", "Gain")]
+  colnames(imp) <- c("Feature", "Gain")
+  imp
+})
+
+# Combine into one data frame
+importance_df <- bind_rows(importance_list, .id = "Imputation")
+
+# Compute mean Gain and standard error per feature
+importance_summary <- importance_df %>%
+  group_by(Feature) %>%
+  summarise(
+    GainMean = mean(Gain, na.rm = TRUE),
+    Variability = sd(Gain, na.rm = TRUE)
+  ) %>%
+  arrange(desc(GainMean))
+
+# Plot top 10 features by mean Gain, with standard error bars
+top_n <- 10
+importance_plot <- importance_summary[1:top_n, ]
+
+ggplot(importance_plot, aes(x = reorder(Feature, GainMean), y = GainMean)) +
+  geom_col(fill = "skyblue") +
+  geom_errorbar(aes(ymin = GainMean - Variability, ymax = GainMean + Variability),
+                width = 0.2, color = "black") +
+  coord_flip() +
+  labs(title = "Variable Importance with Standard Error (Top 20)",
+       x = "Feature",
+       y = "Mean Gain") +
+  theme_minimal()
+```
+
+## Compute SHAP Values
+
+```{r}
+# Impute once, build X_test
+test_imputed <- complete(
+  mice(testing_data, m = 1, method = method, seed = 39748, printFlag = TRUE)
+)
+X_test <- realign_mm(test_imputed)
+
+# Compute per-model SHAP
+shap_raw_list  <- list()
+mean_shap_list <- list()
+
+for (i in seq_along(final_models)) {
+  sv <- shap.values(xgb_model = final_models[[i]], X_train = X_test)
+  shap_raw_list[[i]]  <- as.matrix(sv$shap_score)
+  mean_shap_list[[i]] <- sv$mean_shap_score
+}
+
+# Average across imputations
+shap_avg        <- Reduce(`+`, shap_raw_list)  / length(shap_raw_list)
+mean_shap_score <- Reduce(`+`, mean_shap_list) / length(mean_shap_list)
+
+# Top features by mean
+top10_features <- names(sort(mean_shap_score, decreasing = TRUE)[1:10])
+
+shap_long_top10 %>% filter(!variable %in% exclude_vars)
+
+shap_long <- shap.prep(
+  shap_contrib = as.data.frame(shap_avg),
+  X_train      = X_test
+) %>%
+  filter(variable %in% top10_features, ! variable %in% exclude_vars) %>%
+  mutate(variable = factor(variable, levels = rev(top10_features)))
+
+# Identify binary variables based on unique raw values
+bin_vars <- shap_long %>%
+  group_by(variable) %>%
+  summarise(nval = n_distinct(rfvalue, na.rm = TRUE), .groups = "drop") %>%
+  filter(nval == 2) %>%
+  pull(variable)
+
+# Split data into binary and continuous
+shap_bin  <- filter(shap_long_top10, variable %in% bin_vars)
+
+# Plot
+ggplot() +
+  new_scale_colour() +
+  geom_point(
+    data = shap_bin,
+    aes(x = value, y = variable, colour = factor(rfvalue, levels = c(0, 1))),
+    alpha = 0.8, size = 1.8,
+    position = position_jitter(width = 0, height = 0.2)
+  ) +
+  scale_colour_manual(
+    name = "Raw value (binary)",
+    values = c("0" = "black", "1" = "blue"),
+    drop = FALSE
+  ) +
+  
+  labs(
+    title = "SHAP summary – Top 10 features",
+    x = "SHAP value",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 9),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+```
+
+## Explore Probability Delta due to Feature
+
+```{r}
+# Grab each model’s intercept
+bias0_list <- numeric(length(final_models))
+for (i in seq_along(final_models)) {
+  sv <- shap.values(
+    xgb_model = final_models[[i]],
+    X_train   = X_test
+  )
+  bias0_list[i] <- as.numeric(sv$BIAS0)
+}
+
+# Average the intercepts to get a single baseline og-odds
+mean_bias0 <- mean(bias0_list)
+
+# Build a data‐frame of mean SHAP + probability deltas
+library(tibble)
+
+prob_delta_df <- tibble(
+  variable  = names(mean_shap_score),
+  mean_shap = unname(mean_shap_score),
+  p_before  = plogis(mean_bias0),
+  p_after   = plogis(mean_bias0 + mean_shap),
+  delta_p   = p_after - p_before
+) %>%
+  arrange(desc(delta_p))
+
+# Add a log-ratio column (natural log)
+prob_delta_df <- prob_delta_df %>%
+  mutate(
+    log_ratio = log(p_after / p_before)
+  )
+
+# Top 10 features:
+top10_mean_delta <- prob_delta_df[order(-prob_delta_df$delta_p), ][1:10, ]
+print(top10_mean_delta)
+```
+## Explore Interactions
+
+```{r}
+# Randomly select a model to interpret
+selected_model <- sample(final_models, 1)[[1]]
+
+# Compute usual SHAP values in long-format table
+shap_res   <- shap.values(xgb_model = selected_model, X_train = X_test)
+shap_long  <- shap.prep(shap_contrib = shap_res$shap_score, X_train = X_test)
+
+# Compute the full SHAP interaction array
+# This returns an [n_obs x n_feat x n_feat] array of pairwise interaction contributions
+shap_int <- shap.prep.interaction(
+  xgb_model = selected_model,
+  X_train   = X_test
+)  # :contentReference[oaicite:0]{index=0}
+
+# Compute the mean(|interaction|) for each feature‐pair
+# shap_int is an array [n_obs × n_feat × n_feat]
+int_strength <- apply(abs(shap_int), c(2, 3), mean)
+
+# Turn it into a long tibble for ggplot
+int_df <- as.data.frame(int_strength) %>%
+  rownames_to_column("Feature1") %>%
+  pivot_longer(-Feature1, names_to="Feature2", values_to="MeanAbsInteraction")
+
+# Filter for only unique pairs & threshold > 0.01
+int_df_sig <- int_df %>%
+  filter(Feature1 != Feature2,
+         MeanAbsInteraction > 0.01) %>%
+  arrange(desc(MeanAbsInteraction))
+int_df_sig
+```
